@@ -68,6 +68,45 @@ def coingecko_ohlc(coin_id: str, days: int, retries: int = 3) -> pd.DataFrame | 
     return None
 
 
+def coingecko_chart(coin_id: str, days: int,
+                    resample: str = "1h",
+                    retries: int = 3) -> pd.DataFrame | None:
+    """
+    CoinGecko market_chart → resampled OHLCV.
+    days=1  → ~5-min data  → good for 15M resample
+    days=7  → hourly data  → good for 1H resample
+    """
+    for attempt in range(retries):
+        try:
+            url = (f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+                   f"/market_chart?vs_currency=usd&days={days}")
+            r = requests.get(url, timeout=30)
+            if r.status_code == 429:
+                wait = 15 * (attempt + 1)
+                logger.warning(f"Rate limit chart {coin_id}. Sleeping {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            prices = data.get("prices", [])
+            if len(prices) < 10:
+                return None
+            df = pd.DataFrame(prices, columns=["ts", "close"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            df = df.set_index("ts").sort_index()
+            # Resample to OHLC
+            ohlc = df["close"].resample(resample).ohlc().dropna()
+            ohlc["volume"] = 0
+            ohlc = ohlc.reset_index(drop=True)
+            logger.info(f"CoinGecko chart {coin_id} {days}d→{resample}: {len(ohlc)} rows")
+            return ohlc if len(ohlc) >= 14 else None
+        except Exception as e:
+            logger.warning(f"CoinGecko chart {coin_id} attempt {attempt+1}: {e}")
+            time.sleep(3)
+    return None
+
+
+
 def yf_ohlc(symbol: str, period: str, interval: str,
             mult: float = 1.0) -> pd.DataFrame | None:
     """yfinance OHLCV with optional price multiplier."""
@@ -146,37 +185,36 @@ def fetch_daily_data(asset: str) -> dict:
 
 
 def fetch_intraday_data(asset: str) -> dict:
-    """Fetch 4H + 1H + 15M data for intraday reports."""
-    if asset == "GOLD":
-        logger.info("Gold: fetching 4H...")
-        h4 = coingecko_ohlc("pax-gold", 30)
-        time.sleep(2)
-        price = live_price_cg("pax-gold")
-        time.sleep(2)
-        if h4 is None or len(h4) < 10:
-            h4 = yf_ohlc("GLD", "30d", "4h", 10.0)
-        # 1H and 15M via yfinance (CoinGecko doesn't provide < 4H for free)
-        h1  = yf_ohlc("GLD", "7d",  "1h",  10.0)
-        m15 = yf_ohlc("GLD", "5d",  "15m", 10.0)
-        if price is None:
-            try:
-                import yfinance as yf
-                h = yf.Ticker("GLD").history(period="1d", interval="30m")
-                if h is not None and len(h) > 0:
-                    price = float(h["Close"].iloc[-1]) * 10.0
-            except:
-                pass
-        return {"h4": h4, "h1": h1, "m15": m15, "price": price}
-    else:  # BTC
-        logger.info("BTC: fetching 4H...")
-        h4 = coingecko_ohlc("bitcoin", 30)
-        time.sleep(2)
-        price = live_price_cg("bitcoin")
-        time.sleep(2)
-        if h4 is None or len(h4) < 10: h4 = yf_ohlc("BTC-USD", "30d", "4h")
-        h1  = yf_ohlc("BTC-USD", "7d",  "1h")
-        m15 = yf_ohlc("BTC-USD", "5d",  "15m")
-        return {"h4": h4, "h1": h1, "m15": m15, "price": price}
+    """Fetch 4H + 1H + 15M data — all from CoinGecko (works in cloud)."""
+    coin = "pax-gold" if asset == "GOLD" else "bitcoin"
+
+    logger.info(f"{asset}: fetching 4H (30d ohlc)...")
+    h4 = coingecko_ohlc(coin, 30)
+    time.sleep(3)
+
+    logger.info(f"{asset}: fetching 1H (7d chart → resample 1h)...")
+    h1 = coingecko_chart(coin, 7, resample="1h")
+    time.sleep(3)
+
+    logger.info(f"{asset}: fetching 15M (1d chart → resample 15min)...")
+    m15 = coingecko_chart(coin, 1, resample="15min")
+    time.sleep(2)
+
+    logger.info(f"{asset}: fetching live price...")
+    price = live_price_cg(coin)
+    time.sleep(2)
+
+    # yfinance fallback for 4H only
+    if h4 is None or len(h4) < 10:
+        sym = "GLD" if asset == "GOLD" else "BTC-USD"
+        mult = 10.0 if asset == "GOLD" else 1.0
+        h4 = yf_ohlc(sym, "30d", "4h", mult)
+
+    logger.info(f"{asset} intraday: 4H={len(h4) if h4 is not None else 0}, "
+                f"1H={len(h1) if h1 is not None else 0}, "
+                f"15M={len(m15) if m15 is not None else 0}, price={price}")
+    return {"h4": h4, "h1": h1, "m15": m15, "price": price}
+
 
 
 # ══════════════════════════════════════════════
