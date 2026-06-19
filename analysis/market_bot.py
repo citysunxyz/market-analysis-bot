@@ -99,7 +99,7 @@ def coingecko_chart(coin_id: str, days: int,
             ohlc["volume"] = 0
             ohlc = ohlc.reset_index(drop=True)
             logger.info(f"CoinGecko chart {coin_id} {days}d→{resample}: {len(ohlc)} rows")
-            return ohlc if len(ohlc) >= 14 else None
+            return ohlc if len(ohlc) >= 8 else None
         except Exception as e:
             logger.warning(f"CoinGecko chart {coin_id} attempt {attempt+1}: {e}")
             time.sleep(3)
@@ -196,8 +196,11 @@ def fetch_intraday_data(asset: str) -> dict:
     h1 = coingecko_chart(coin, 7, resample="1h")
     time.sleep(3)
 
-    logger.info(f"{asset}: fetching 15M (1d chart → resample 15min)...")
-    m15 = coingecko_chart(coin, 1, resample="15min")
+    logger.info(f"{asset}: fetching 15M (2d chart → resample 15min)...")
+    m15 = coingecko_chart(coin, 2, resample="15min")
+    if m15 is None:
+        logger.info(f"{asset}: 15M fallback → 1d resample 30min...")
+        m15 = coingecko_chart(coin, 1, resample="30min")
     time.sleep(2)
 
     logger.info(f"{asset}: fetching live price...")
