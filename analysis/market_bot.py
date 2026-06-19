@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📊 BTC & Gold Market Analysis Bot
-====================================
-প্রতি ৪ ঘণ্টায় BTC ও Gold-এর টেকনিক্যাল এনালাইসিস করে
-Telegram-এ রিপোর্ট পাঠায়।
-
-তৈরিকারক: GitHub Actions Automated Bot
+BTC & Gold Market Analysis Telegram Bot
+- Gold: CoinGecko free API (XAUUSD via metals-api fallback to yfinance GLD)
+- BTC:  CoinGecko free API
 """
 
 import os
@@ -16,24 +13,13 @@ import requests
 import numpy as np
 import pandas as pd
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-
-# ta লাইব্রেরি থেকে ইন্ডিকেটর
-import ta
 from ta.trend import MACD, EMAIndicator, SMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 
-# yfinance
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-
-# ------------------------------------------------------------------
-# লগিং সেটআপ
-# ------------------------------------------------------------------
+load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -41,342 +27,331 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# .env ফাইল লোড (লোকাল টেস্টিং-এর জন্য)
-load_dotenv()
-
-# ------------------------------------------------------------------
-# কনফিগারেশন
-# ------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-SYMBOLS = {
-    "GOLD": {"yf_symbol": "GC=F",  "name": "Gold (XAUUSD)", "emoji": "🥇"},
-    "BTC":  {"yf_symbol": "BTC-USD","name": "Bitcoin (BTC/USD)", "emoji": "₿"},
-}
-
 BD_TZ = pytz.timezone("Asia/Dhaka")
 
+# ──────────────────────────────────────────────
+# DATA FETCHING — CoinGecko Free API
+# ──────────────────────────────────────────────
 
-# ==================================================================
-# ডেটা ফেচ ফাংশন
-# ==================================================================
-def fetch_ohlcv(yf_symbol: str, period: str = "60d", interval: str = "1h") -> pd.DataFrame | None:
-    """Yahoo Finance থেকে OHLCV ডেটা আনুন।"""
+def fetch_btc_ohlc(days: int = 30) -> pd.DataFrame | None:
+    """BTC OHLC data from CoinGecko (free, no API key needed)."""
     try:
-        ticker = yf.Ticker(yf_symbol)
-        df = ticker.history(period=period, interval=interval)
-        if df is None or df.empty:
-            logger.warning(f"No data for {yf_symbol}")
+        # CoinGecko returns OHLC in 4h candles for 30 days
+        url = f"https://api.coingecko.com/api/v3/coins/bitcoin/ohlc?vs_currency=usd&days={days}"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
             return None
-        df.columns = [c.lower() for c in df.columns]
-        df = df[["open", "high", "low", "close", "volume"]].dropna()
-        logger.info(f"✅ Fetched {len(df)} rows for {yf_symbol}")
+        df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        df["volume"] = 0  # CoinGecko OHLC doesn't include volume
+        logger.info(f"BTC: fetched {len(df)} candles from CoinGecko")
         return df
     except Exception as e:
-        logger.error(f"❌ Error fetching {yf_symbol}: {e}")
+        logger.error(f"BTC CoinGecko error: {e}")
         return None
 
 
-def fetch_daily(yf_symbol: str) -> pd.DataFrame | None:
-    """Daily ডেটা আনুন (সাপোর্ট/রেজিস্ট্যান্স ও ট্রেন্ডের জন্য)।"""
-    return fetch_ohlcv(yf_symbol, period="180d", interval="1d")
+def fetch_btc_price() -> float | None:
+    """Get current BTC price."""
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        return resp.json()["bitcoin"]["usd"]
+    except Exception as e:
+        logger.error(f"BTC price error: {e}")
+        return None
 
 
-# ==================================================================
-# টেকনিক্যাল ইন্ডিকেটর
-# ==================================================================
-def compute_indicators(df: pd.DataFrame) -> dict:
-    """সব টেকনিক্যাল ইন্ডিকেটর হিসাব করুন।"""
+def fetch_gold_ohlc() -> pd.DataFrame | None:
+    """
+    Gold OHLC — tries multiple sources:
+    1. yfinance GLD (SPDR Gold ETF, very reliable)
+    2. yfinance XAUUSD=X
+    3. yfinance GC=F (Gold Futures)
+    """
+    symbols_to_try = ["GLD", "XAUUSD=X", "GC=F", "IAU"]
+    multipliers    = {"GLD": 10.0, "GC=F": 1.0, "XAUUSD=X": 1.0, "IAU": 19.5}
+
+    try:
+        import yfinance as yf
+        for sym in symbols_to_try:
+            try:
+                ticker = yf.Ticker(sym)
+                df = ticker.history(period="60d", interval="4h")
+                if df is not None and len(df) >= 30:
+                    df.columns = [c.lower() for c in df.columns]
+                    df = df[["open", "high", "low", "close", "volume"]].dropna()
+                    mult = multipliers.get(sym, 1.0)
+                    for col in ["open", "high", "low", "close"]:
+                        df[col] = df[col] * mult
+                    logger.info(f"Gold: fetched {len(df)} candles via {sym} (x{mult})")
+                    return df
+            except Exception as e2:
+                logger.warning(f"Gold {sym} failed: {e2}")
+                continue
+    except ImportError:
+        pass
+
+    # Fallback: CoinGecko XAU via Paxos Gold (PAXG)
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/pax-gold/ohlc?vs_currency=usd&days=30"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and len(data) >= 20:
+            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            df["volume"] = 0
+            logger.info(f"Gold: fetched {len(df)} candles via PAXG (CoinGecko)")
+            return df
+    except Exception as e3:
+        logger.error(f"Gold PAXG error: {e3}")
+
+    return None
+
+
+def fetch_gold_price() -> float | None:
+    """Get current Gold price (PAXG ≈ XAUUSD)."""
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=pax-gold&vs_currencies=usd"
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        return resp.json()["pax-gold"]["usd"]
+    except Exception as e:
+        logger.error(f"Gold price error: {e}")
+        # Fallback: yfinance
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker("GLD")
+            hist = ticker.history(period="1d", interval="1h")
+            if hist is not None and len(hist) > 0:
+                return float(hist["Close"].iloc[-1]) * 10.0
+        except:
+            pass
+        return None
+
+
+# ──────────────────────────────────────────────
+# TECHNICAL INDICATORS
+# ──────────────────────────────────────────────
+
+def compute_indicators(df: pd.DataFrame, current_price: float | None = None) -> dict | None:
+    """Calculate all technical indicators from OHLCV dataframe."""
+    if df is None or len(df) < 20:
+        return None
+
     close = df["close"]
     high  = df["high"]
     low   = df["low"]
 
-    # ---- RSI ----
-    rsi_val = RSIIndicator(close=close, window=14).rsi().iloc[-1]
+    if current_price:
+        # Use live price as the last close
+        close = close.copy()
+        close.iloc[-1] = current_price
 
-    # ---- MACD ----
-    macd_obj  = MACD(close=close)
-    macd_val  = macd_obj.macd().iloc[-1]
-    macd_sig  = macd_obj.macd_signal().iloc[-1]
-    macd_diff = macd_obj.macd_diff().iloc[-1]
+    try:
+        rsi_val  = RSIIndicator(close=close, window=14).rsi().iloc[-1]
+        macd_obj = MACD(close=close)
+        macd_val = macd_obj.macd().iloc[-1]
+        macd_sig = macd_obj.macd_signal().iloc[-1]
+        macd_diff= macd_obj.macd_diff().iloc[-1]
+        ema20    = EMAIndicator(close=close, window=min(20, len(close)-1)).ema_indicator().iloc[-1]
+        ema50    = EMAIndicator(close=close, window=min(50, len(close)-1)).ema_indicator().iloc[-1]
+        sma200   = SMAIndicator(close=close, window=min(200, len(close))).sma_indicator().iloc[-1]
+        bb       = BollingerBands(close=close, window=min(20, len(close)-1), window_dev=2)
+        bb_up    = bb.bollinger_hband().iloc[-1]
+        bb_mid   = bb.bollinger_mavg().iloc[-1]
+        bb_low   = bb.bollinger_lband().iloc[-1]
+        bb_pct   = bb.bollinger_pband().iloc[-1]
+        atr      = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range().iloc[-1]
 
-    # ---- Moving Averages ----
-    ema20  = EMAIndicator(close=close, window=20).ema_indicator().iloc[-1]
-    ema50  = EMAIndicator(close=close, window=50).ema_indicator().iloc[-1]
-    sma200 = SMAIndicator(close=close, window=min(200, len(close))).sma_indicator().iloc[-1]
+        price      = float(close.iloc[-1])
+        prev_close = float(close.iloc[-2])
+        pct_change = (price - prev_close) / prev_close * 100
 
-    # ---- Bollinger Bands ----
-    bb     = BollingerBands(close=close, window=20, window_dev=2)
-    bb_up  = bb.bollinger_hband().iloc[-1]
-    bb_mid = bb.bollinger_mavg().iloc[-1]
-    bb_low = bb.bollinger_lband().iloc[-1]
-    bb_pct = bb.bollinger_pband().iloc[-1]  # 0–1: 0=at lower, 1=at upper
+        recent_high  = float(high.iloc[-20:].max())
+        recent_low   = float(low.iloc[-20:].min())
+        pivot        = (recent_high + recent_low + price) / 3
+        resistance1  = 2 * pivot - recent_low
+        support1     = 2 * pivot - recent_high
+        resistance2  = pivot + (recent_high - recent_low)
+        support2     = pivot - (recent_high - recent_low)
 
-    # ---- ATR (ভোলাটিলিটি) ----
-    atr = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range().iloc[-1]
-
-    # ---- সাম্প্রতিক ক্যান্ডেল ডেটা ----
-    current_price = close.iloc[-1]
-    prev_close    = close.iloc[-2]
-    pct_change    = (current_price - prev_close) / prev_close * 100
-
-    # ---- সাপোর্ট ও রেজিস্ট্যান্স (শেষ ২০ ক্যান্ডেলের লো/হাই) ----
-    recent_high  = high.iloc[-20:].max()
-    recent_low   = low.iloc[-20:].min()
-    pivot        = (recent_high + recent_low + current_price) / 3
-    resistance1  = 2 * pivot - recent_low
-    support1     = 2 * pivot - recent_high
-    resistance2  = pivot + (recent_high - recent_low)
-    support2     = pivot - (recent_high - recent_low)
-
-    return {
-        "price":      current_price,
-        "pct_change": pct_change,
-        "rsi":        rsi_val,
-        "macd":       macd_val,
-        "macd_sig":   macd_sig,
-        "macd_hist":  macd_diff,
-        "ema20":      ema20,
-        "ema50":      ema50,
-        "sma200":     sma200,
-        "bb_upper":   bb_up,
-        "bb_mid":     bb_mid,
-        "bb_lower":   bb_low,
-        "bb_pct":     bb_pct,
-        "atr":        atr,
-        "support1":   support1,
-        "support2":   support2,
-        "resistance1":resistance1,
-        "resistance2":resistance2,
-    }
+        return {
+            "price": price, "pct_change": pct_change,
+            "rsi": rsi_val, "macd": macd_val, "macd_sig": macd_sig, "macd_hist": macd_diff,
+            "ema20": ema20, "ema50": ema50, "sma200": sma200,
+            "bb_upper": bb_up, "bb_mid": bb_mid, "bb_lower": bb_low, "bb_pct": bb_pct,
+            "atr": atr,
+            "support1": support1, "support2": support2,
+            "resistance1": resistance1, "resistance2": resistance2,
+        }
+    except Exception as e:
+        logger.error(f"Indicator error: {e}")
+        return None
 
 
-# ==================================================================
-# সিগনাল জেনারেটর
-# ==================================================================
-def generate_signal(ind: dict, daily_df: pd.DataFrame | None) -> dict:
-    """
-    সকল ইন্ডিকেটর থেকে একটি সামগ্রিক সিগনাল তৈরি করুন।
-    Returns: {"bias": "BUY/SELL/NEUTRAL", "strength": "STRONG/MODERATE/WEAK", "reasons": [...]}
-    """
-    buy_points  = 0
-    sell_points = 0
-    reasons     = []
+# ──────────────────────────────────────────────
+# SIGNAL GENERATOR
+# ──────────────────────────────────────────────
 
-    price   = ind["price"]
-    rsi     = ind["rsi"]
-    macd_h  = ind["macd_hist"]
-    ema20   = ind["ema20"]
-    ema50   = ind["ema50"]
-    sma200  = ind["sma200"]
-    bb_pct  = ind["bb_pct"]
+def generate_signal(ind: dict) -> dict:
+    buy_points = sell_points = 0
+    reasons = []
+    price, rsi, macd_h = ind["price"], ind["rsi"], ind["macd_hist"]
+    ema20, ema50, sma200, bb_pct = ind["ema20"], ind["ema50"], ind["sma200"], ind["bb_pct"]
 
-    # RSI বিশ্লেষণ
     if rsi < 35:
-        buy_points += 2
-        reasons.append(f"📉 RSI অতিবিক্রীত ({rsi:.1f}) — বাই সুযোগ")
+        buy_points += 2; reasons.append(f"RSI oversold ({rsi:.1f}) — buy opportunity")
     elif rsi > 65:
-        sell_points += 2
-        reasons.append(f"📈 RSI অতিক্রীত ({rsi:.1f}) — সেল চাপ সম্ভব")
+        sell_points += 2; reasons.append(f"RSI overbought ({rsi:.1f}) — sell pressure")
     elif rsi > 50:
-        buy_points += 1
-        reasons.append(f"RSI বুলিশ জোনে ({rsi:.1f})")
+        buy_points += 1; reasons.append(f"RSI bullish zone ({rsi:.1f})")
     else:
-        sell_points += 1
-        reasons.append(f"RSI বিয়ারিশ জোনে ({rsi:.1f})")
+        sell_points += 1; reasons.append(f"RSI bearish zone ({rsi:.1f})")
 
-    # MACD হিস্টোগ্রাম
     if macd_h > 0:
-        buy_points += 1
-        reasons.append("MACD হিস্টোগ্রাম পজিটিভ (বুলিশ মোমেন্টাম)")
+        buy_points += 1; reasons.append("MACD histogram positive (bullish momentum)")
     else:
-        sell_points += 1
-        reasons.append("MACD হিস্টোগ্রাম নেগেটিভ (বিয়ারিশ মোমেন্টাম)")
+        sell_points += 1; reasons.append("MACD histogram negative (bearish momentum)")
 
-    # মূল্য vs EMA20
     if price > ema20:
-        buy_points += 1
-        reasons.append(f"মূল্য EMA20 (${ema20:,.2f}) উপরে ✅")
+        buy_points += 1; reasons.append(f"Price above EMA20 (${ema20:,.2f})")
     else:
-        sell_points += 1
-        reasons.append(f"মূল্য EMA20 (${ema20:,.2f}) নিচে ❌")
+        sell_points += 1; reasons.append(f"Price below EMA20 (${ema20:,.2f})")
 
-    # মূল্য vs EMA50
     if price > ema50:
-        buy_points += 1
-        reasons.append(f"মূল্য EMA50 (${ema50:,.2f}) উপরে ✅")
+        buy_points += 1; reasons.append(f"Price above EMA50 (${ema50:,.2f})")
     else:
-        sell_points += 1
-        reasons.append(f"মূল্য EMA50 (${ema50:,.2f}) নিচে ❌")
+        sell_points += 1; reasons.append(f"Price below EMA50 (${ema50:,.2f})")
 
-    # মূল্য vs SMA200
     if price > sma200:
-        buy_points += 1
-        reasons.append(f"মূল্য SMA200 (${sma200:,.2f}) উপরে — দীর্ঘমেয়াদী বুলিশ ✅")
+        buy_points += 1; reasons.append(f"Price above SMA200 — long-term bullish")
     else:
-        sell_points += 1
-        reasons.append(f"মূল্য SMA200 (${sma200:,.2f}) নিচে — দীর্ঘমেয়াদী বিয়ারিশ ❌")
+        sell_points += 1; reasons.append(f"Price below SMA200 — long-term bearish")
 
-    # Bollinger Band অবস্থান
     if bb_pct < 0.2:
-        buy_points += 2
-        reasons.append(f"BB লোয়ার ব্যান্ডের কাছে — ওভারসোল্ড রিবাউন্ড সম্ভব")
+        buy_points += 2; reasons.append("Near BB lower band — oversold bounce possible")
     elif bb_pct > 0.8:
-        sell_points += 2
-        reasons.append(f"BB আপার ব্যান্ডের কাছে — ওভারবট, রিজেকশন সম্ভব")
+        sell_points += 2; reasons.append("Near BB upper band — overbought, rejection possible")
 
-    # সামগ্রিক বায়াস নির্ধারণ
     total = buy_points + sell_points
     if total == 0:
-        bias = "NEUTRAL"
-        strength = "WEAK"
+        bias, strength = "NEUTRAL", "WEAK"
     elif buy_points > sell_points:
-        bias = "BUY"
-        ratio = buy_points / total
+        bias = "BUY"; ratio = buy_points / total
         strength = "STRONG" if ratio >= 0.7 else "MODERATE"
     elif sell_points > buy_points:
-        bias = "SELL"
-        ratio = sell_points / total
+        bias = "SELL"; ratio = sell_points / total
         strength = "STRONG" if ratio >= 0.7 else "MODERATE"
     else:
-        bias = "NEUTRAL"
-        strength = "MODERATE"
+        bias, strength = "NEUTRAL", "MODERATE"
 
     return {"bias": bias, "strength": strength, "reasons": reasons}
 
 
-# ==================================================================
-# ট্রেড সেটআপ
-# ==================================================================
-def build_trade_setup(ind: dict, signal: dict, name: str) -> str:
-    """সিগনালের ভিত্তিতে ট্রেড সেটআপ তৈরি করুন।"""
-    price  = ind["price"]
-    atr    = ind["atr"]
-    bias   = signal["bias"]
+# ──────────────────────────────────────────────
+# MESSAGE BUILDER
+# ──────────────────────────────────────────────
 
-    if bias == "BUY":
-        sl  = price - 1.5 * atr
-        tp1 = price + 1.5 * atr
-        tp2 = price + 2.5 * atr
-        tp3 = price + 4.0 * atr
-        rr1 = 1.5
-        setup = (
-            f"🟢 *লং (Buy) সেটআপ*\n"
-            f"  ├ এন্ট্রি: `${price:,.2f}`\n"
-            f"  ├ স্টপ লস: `${sl:,.2f}` (-{1.5*atr/price*100:.1f}%)\n"
-            f"  ├ TP1: `${tp1:,.2f}` (+{1.5*atr/price*100:.1f}%) R:R=1:1.5\n"
-            f"  ├ TP2: `${tp2:,.2f}` (+{2.5*atr/price*100:.1f}%) R:R=1:2.5\n"
-            f"  └ TP3: `${tp3:,.2f}` (+{4.0*atr/price*100:.1f}%) R:R=1:4\n"
-        )
-    elif bias == "SELL":
-        sl  = price + 1.5 * atr
-        tp1 = price - 1.5 * atr
-        tp2 = price - 2.5 * atr
-        tp3 = price - 4.0 * atr
-        setup = (
-            f"🔴 *শর্ট (Sell) সেটআপ*\n"
-            f"  ├ এন্ট্রি: `${price:,.2f}`\n"
-            f"  ├ স্টপ লস: `${sl:,.2f}` (+{1.5*atr/price*100:.1f}%)\n"
-            f"  ├ TP1: `${tp1:,.2f}` (-{1.5*atr/price*100:.1f}%) R:R=1:1.5\n"
-            f"  ├ TP2: `${tp2:,.2f}` (-{2.5*atr/price*100:.1f}%) R:R=1:2.5\n"
-            f"  └ TP3: `${tp3:,.2f}` (-{4.0*atr/price*100:.1f}%) R:R=1:4\n"
-        )
-    else:
-        setup = (
-            f"⚪ *নিউট্রাল — অপেক্ষা করুন*\n"
-            f"  ├ সাপোর্ট: `${ind['support1']:,.2f}`\n"
-            f"  └ রেজিস্ট্যান্স: `${ind['resistance1']:,.2f}`\n"
-        )
-
-    return setup
-
-
-# ==================================================================
-# Telegram মেসেজ বিল্ডার
-# ==================================================================
-def build_message(symbol: str, meta: dict, ind: dict, signal: dict, df_1h: pd.DataFrame) -> str:
-    """Telegram মার্কডাউন মেসেজ তৈরি করুন।"""
+def build_message(name: str, emoji: str, ind: dict, signal: dict) -> str:
     now_bd = datetime.now(BD_TZ).strftime("%d %b %Y | %I:%M %p")
-
-    # সিগনাল ইমোজি
     bias_map = {
-        "BUY":     ("🟢 BUY",   "📈 বুলিশ"),
-        "SELL":    ("🔴 SELL",  "📉 বিয়ারিশ"),
-        "NEUTRAL": ("⚪ WAIT",  "↔️ নিউট্রাল"),
+        "BUY":     ("🟢 BUY",  "📈 Bullish"),
+        "SELL":    ("🔴 SELL", "📉 Bearish"),
+        "NEUTRAL": ("⚪ WAIT", "↔️ Neutral"),
     }
     sig_label, bias_label = bias_map[signal["bias"]]
-    strength_label = {"STRONG": "🔥 শক্তিশালী", "MODERATE": "⚡ মাঝারি", "WEAK": "💤 দুর্বল"}.get(signal["strength"], "")
-
-    # প্রাইস পরিবর্তন ইমোজি
+    str_map = {"STRONG": "🔥 Strong", "MODERATE": "⚡ Moderate", "WEAK": "💤 Weak"}
+    strength_label = str_map.get(signal["strength"], "")
     chg = ind["pct_change"]
     chg_icon = "📈" if chg >= 0 else "📉"
-
-    # RSI ব্যাখ্যা
     rsi = ind["rsi"]
-    rsi_label = "অতিক্রীত (Overbought)" if rsi > 70 else "অতিবিক্রীত (Oversold)" if rsi < 30 else "নরমাল"
+    rsi_label = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Normal"
+    macd_label = "✅ Bullish crossover" if ind["macd"] > ind["macd_sig"] else "❌ Bearish crossover"
 
-    # MACD ব্যাখ্যা
-    macd_label = "✅ বুলিশ ক্রসওভার" if ind["macd"] > ind["macd_sig"] else "❌ বিয়ারিশ ক্রসওভার"
+    price = ind["price"]
+    atr   = ind["atr"]
+    bias  = signal["bias"]
 
-    # ট্রেড সেটআপ
-    trade_setup = build_trade_setup(ind, signal, meta["name"])
+    if bias == "BUY":
+        sl, tp1, tp2, tp3 = price - 1.5*atr, price + 1.5*atr, price + 2.5*atr, price + 4.0*atr
+        trade = (
+            f"🟢 *Long (Buy) Setup*\n"
+            f"  ├ Entry: `${price:,.2f}`\n"
+            f"  ├ Stop Loss: `${sl:,.2f}`\n"
+            f"  ├ TP1: `${tp1:,.2f}` R:R=1:1.5\n"
+            f"  ├ TP2: `${tp2:,.2f}` R:R=1:2.5\n"
+            f"  └ TP3: `${tp3:,.2f}` R:R=1:4"
+        )
+    elif bias == "SELL":
+        sl, tp1, tp2, tp3 = price + 1.5*atr, price - 1.5*atr, price - 2.5*atr, price - 4.0*atr
+        trade = (
+            f"🔴 *Short (Sell) Setup*\n"
+            f"  ├ Entry: `${price:,.2f}`\n"
+            f"  ├ Stop Loss: `${sl:,.2f}`\n"
+            f"  ├ TP1: `${tp1:,.2f}` R:R=1:1.5\n"
+            f"  ├ TP2: `${tp2:,.2f}` R:R=1:2.5\n"
+            f"  └ TP3: `${tp3:,.2f}` R:R=1:4"
+        )
+    else:
+        trade = (
+            f"⚪ *Neutral — Wait for setup*\n"
+            f"  ├ Support: `${ind['support1']:,.2f}`\n"
+            f"  └ Resistance: `${ind['resistance1']:,.2f}`"
+        )
 
-    # কারণগুলো
     reasons_text = "\n".join([f"  • {r}" for r in signal["reasons"][:5]])
 
-    msg = f"""
-{meta['emoji']} *{meta['name']} — মার্কেট এনালাইসিস*
-🕐 *সময়:* {now_bd} (BST)
-━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💰 *বর্তমান মূল্য:* `${ind['price']:,.2f}`
-{chg_icon} *পরিবর্তন:* `{chg:+.2f}%` (গত ক্যান্ডেল থেকে)
-
-📊 *টেকনিক্যাল ইন্ডিকেটর (1H)*
-  ├ RSI (14): `{rsi:.1f}` — {rsi_label}
-  ├ MACD: {macd_label}
-  ├ EMA20: `${ind['ema20']:,.2f}`
-  ├ EMA50: `${ind['ema50']:,.2f}`
-  └ SMA200: `${ind['sma200']:,.2f}`
-
-📐 *Bollinger Bands*
-  ├ 🔴 আপার: `${ind['bb_upper']:,.2f}`
-  ├ ⚪ মিড:   `${ind['bb_mid']:,.2f}`
-  └ 🟢 লোয়ার: `${ind['bb_lower']:,.2f}`
-
-🔑 *কী লেভেল (Pivot Points)*
-  ├ 🔴 R2: `${ind['resistance2']:,.2f}`
-  ├ 🔴 R1: `${ind['resistance1']:,.2f}`
-  ├ ⚪ বর্তমান: `${ind['price']:,.2f}` ◀
-  ├ 🟢 S1: `${ind['support1']:,.2f}`
-  └ 🟢 S2: `${ind['support2']:,.2f}`
-
-⚡ *ATR (ভোলাটিলিটি):* `${ind['atr']:,.2f}`
-
-━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 *সামগ্রিক বায়াস: {sig_label}* | {strength_label}
-
-📋 *বিশ্লেষণের কারণ:*
-{reasons_text}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━
-{trade_setup}
-━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ _এটি শুধুমাত্র শিক্ষামূলক বিশ্লেষণ। ট্রেডের আগে নিজস্ব গবেষণা করুন এবং রিস্ক ম্যানেজমেন্ট মেনে চলুন।_
-"""
-    return msg.strip()
+    msg = (
+        f"{emoji} *{name} — Market Analysis*\n"
+        f"🕐 *Time:* {now_bd} (BST)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 *Current Price:* `${ind['price']:,.2f}`\n"
+        f"{chg_icon} *Change:* `{chg:+.2f}%`\n\n"
+        f"📊 *Technical Indicators*\n"
+        f"  ├ RSI(14): `{rsi:.1f}` — {rsi_label}\n"
+        f"  ├ MACD: {macd_label}\n"
+        f"  ├ EMA20: `${ind['ema20']:,.2f}`\n"
+        f"  ├ EMA50: `${ind['ema50']:,.2f}`\n"
+        f"  └ SMA200: `${ind['sma200']:,.2f}`\n\n"
+        f"📐 *Bollinger Bands*\n"
+        f"  ├ 🔴 Upper: `${ind['bb_upper']:,.2f}`\n"
+        f"  ├ ⚪ Mid:   `${ind['bb_mid']:,.2f}`\n"
+        f"  └ 🟢 Lower: `${ind['bb_lower']:,.2f}`\n\n"
+        f"🔑 *Key Levels*\n"
+        f"  ├ 🔴 R2: `${ind['resistance2']:,.2f}`\n"
+        f"  ├ 🔴 R1: `${ind['resistance1']:,.2f}`\n"
+        f"  ├ ◀ Now: `${ind['price']:,.2f}`\n"
+        f"  ├ 🟢 S1: `${ind['support1']:,.2f}`\n"
+        f"  └ 🟢 S2: `${ind['support2']:,.2f}`\n\n"
+        f"⚡ *ATR (Volatility):* `${ind['atr']:,.2f}`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 *Signal: {sig_label}* | {strength_label}\n\n"
+        f"📋 *Reasons:*\n{reasons_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{trade}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ _Educational analysis only. Always use risk management._"
+    )
+    return msg
 
 
-# ==================================================================
-# Telegram পাঠানো
-# ==================================================================
+# ──────────────────────────────────────────────
+# TELEGRAM
+# ──────────────────────────────────────────────
+
 def send_telegram(message: str) -> bool:
-    """Telegram Bot API-তে মেসেজ পাঠান।"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("❌ TELEGRAM_BOT_TOKEN বা TELEGRAM_CHAT_ID সেট নেই!")
+        logger.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         return False
-
     url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {
         "chat_id":    TELEGRAM_CHAT_ID,
@@ -384,75 +359,75 @@ def send_telegram(message: str) -> bool:
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
-
     try:
         resp = requests.post(url, json=data, timeout=30)
         resp.raise_for_status()
-        logger.info("✅ Telegram-এ মেসেজ পাঠানো সফল!")
+        logger.info("Telegram message sent!")
         return True
     except requests.exceptions.HTTPError as e:
-        logger.error(f"❌ Telegram HTTP Error: {e.response.text}")
+        logger.error(f"Telegram HTTP error: {e.response.text}")
         return False
     except Exception as e:
-        logger.error(f"❌ Telegram Error: {e}")
+        logger.error(f"Telegram error: {e}")
         return False
 
 
-def send_divider():
-    """দুটি সিম্বলের মাঝে একটি বিভাজক মেসেজ পাঠান।"""
-    now_bd = datetime.now(BD_TZ).strftime("%d %b %Y | %I:%M %p")
-    msg = f"━━━━━━━━━━━━━━━━━━━━━━━━━\n📊 *অটোমেটেড মার্কেট রিপোর্ট*\n🕐 {now_bd} (BST)\nদুটি সিম্বলের এনালাইসিস নিচে দেওয়া হলো 👇"
-    send_telegram(msg)
-
-
-# ==================================================================
-# মেইন ফাংশন
-# ==================================================================
-def analyze_symbol(symbol: str) -> bool:
-    """একটি সিম্বল এনালাইজ করে Telegram পাঠান।"""
-    meta = SYMBOLS[symbol]
-    yf_sym = meta["yf_symbol"]
-
-    logger.info(f"🔍 Analyzing {symbol} ({yf_sym})...")
-
-    # ডেটা আনুন
-    df_1h = fetch_ohlcv(yf_sym, period="60d", interval="1h")
-    if df_1h is None or len(df_1h) < 50:
-        logger.error(f"❌ {symbol}: পর্যাপ্ত ডেটা নেই")
-        send_telegram(f"❌ {meta['name']}: মার্কেট ডেটা পাওয়া যায়নি। পরবর্তী সেশনে আবার চেষ্টা করা হবে।")
-        return False
-
-    df_daily = fetch_daily(yf_sym)
-
-    # ইন্ডিকেটর ও সিগনাল
-    ind    = compute_indicators(df_1h)
-    signal = generate_signal(ind, df_daily)
-
-    # মেসেজ তৈরি ও পাঠানো
-    message = build_message(symbol, meta, ind, signal, df_1h)
-    return send_telegram(message)
-
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
 
 def main():
-    logger.info("🚀 Market Analysis Bot শুরু হচ্ছে...")
+    logger.info("Market Analysis Bot starting...")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("❌ পরিবেশ চলকগুলো সেট করা নেই। GitHub Secrets চেক করুন।")
+        logger.error("Missing environment variables!")
         sys.exit(1)
 
-    # শুরুর মেসেজ
-    send_divider()
+    now_bd = datetime.now(BD_TZ).strftime("%d %b %Y | %I:%M %p")
+    send_telegram(
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *Automated Market Report*\n"
+        f"🕐 {now_bd} (BST)\n"
+        f"BTC & Gold analysis below 👇\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
 
-    # Gold এনালাইসিস
-    gold_ok = analyze_symbol("GOLD")
+    results = []
 
-    # BTC এনালাইসিস
-    btc_ok = analyze_symbol("BTC")
+    # ── GOLD ──
+    logger.info("Fetching Gold data...")
+    gold_df    = fetch_gold_ohlc()
+    gold_price = fetch_gold_price()
+    gold_ind   = compute_indicators(gold_df, gold_price)
 
-    if gold_ok and btc_ok:
-        logger.info("✅ সব এনালাইসিস সফলভাবে পাঠানো হয়েছে!")
+    if gold_ind:
+        gold_signal = generate_signal(gold_ind)
+        gold_msg    = build_message("Gold (XAUUSD)", "🥇", gold_ind, gold_signal)
+        results.append(send_telegram(gold_msg))
+        logger.info(f"Gold: ${gold_ind['price']:,.2f} | {gold_signal['bias']} {gold_signal['strength']}")
     else:
-        logger.warning("⚠️ কিছু এনালাইসিস ব্যর্থ হয়েছে।")
+        send_telegram("❌ Gold: Could not fetch market data. Will retry next session.")
+        results.append(False)
+
+    # ── BTC ──
+    logger.info("Fetching BTC data...")
+    btc_df    = fetch_btc_ohlc(days=30)
+    btc_price = fetch_btc_price()
+    btc_ind   = compute_indicators(btc_df, btc_price)
+
+    if btc_ind:
+        btc_signal = generate_signal(btc_ind)
+        btc_msg    = build_message("Bitcoin (BTC/USD)", "₿", btc_ind, btc_signal)
+        results.append(send_telegram(btc_msg))
+        logger.info(f"BTC: ${btc_ind['price']:,.2f} | {btc_signal['bias']} {btc_signal['strength']}")
+    else:
+        send_telegram("❌ BTC: Could not fetch market data. Will retry next session.")
+        results.append(False)
+
+    if all(results):
+        logger.info("All reports sent successfully!")
+    else:
+        logger.warning("Some reports failed.")
         sys.exit(1)
 
 
