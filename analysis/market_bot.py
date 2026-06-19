@@ -2,408 +2,364 @@
 # -*- coding: utf-8 -*-
 """
 BTC & Gold Market Analysis Telegram Bot
-- Gold: CoinGecko free API (XAUUSD via metals-api fallback to yfinance GLD)
-- BTC:  CoinGecko free API
+Multi-timeframe analysis with key levels and trade setups.
 """
 
-import os
-import sys
-import logging
-import requests
+import os, sys, logging, requests
 import numpy as np
 import pandas as pd
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from ta.trend import MACD, EMAIndicator, SMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
+                    handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 BD_TZ = pytz.timezone("Asia/Dhaka")
 
-# ──────────────────────────────────────────────
-# DATA FETCHING — CoinGecko Free API
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# DATA FETCHING
+# ══════════════════════════════════════════════
 
-def fetch_btc_ohlc(days: int = 30) -> pd.DataFrame | None:
-    """BTC OHLC data from CoinGecko (free, no API key needed)."""
+def coingecko_ohlc(coin_id: str, days: int) -> pd.DataFrame | None:
+    """Fetch OHLC from CoinGecko free API."""
     try:
-        # CoinGecko returns OHLC in 4h candles for 30 days
-        url = f"https://api.coingecko.com/api/v3/coins/bitcoin/ohlc?vs_currency=usd&days={days}"
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if not data:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if not data or len(data) < 5:
             return None
-        df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        df["volume"] = 0  # CoinGecko OHLC doesn't include volume
-        logger.info(f"BTC: fetched {len(df)} candles from CoinGecko")
+        df = pd.DataFrame(data, columns=["ts","open","high","low","close"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        df = df.sort_values("ts").reset_index(drop=True)
+        df["volume"] = 0
         return df
     except Exception as e:
-        logger.error(f"BTC CoinGecko error: {e}")
+        logger.warning(f"CoinGecko {coin_id} {days}d error: {e}")
         return None
 
-
-def fetch_btc_price() -> float | None:
-    """Get current BTC price."""
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        return resp.json()["bitcoin"]["usd"]
-    except Exception as e:
-        logger.error(f"BTC price error: {e}")
-        return None
-
-
-def fetch_gold_ohlc() -> pd.DataFrame | None:
-    """
-    Gold OHLC — tries multiple sources:
-    1. yfinance GLD (SPDR Gold ETF, very reliable)
-    2. yfinance XAUUSD=X
-    3. yfinance GC=F (Gold Futures)
-    """
-    symbols_to_try = ["GLD", "XAUUSD=X", "GC=F", "IAU"]
-    multipliers    = {"GLD": 10.0, "GC=F": 1.0, "XAUUSD=X": 1.0, "IAU": 19.5}
-
+def yf_ohlc(symbol: str, period: str, interval: str, multiplier: float = 1.0) -> pd.DataFrame | None:
+    """Fetch OHLC from yfinance."""
     try:
         import yfinance as yf
-        for sym in symbols_to_try:
-            try:
-                ticker = yf.Ticker(sym)
-                df = ticker.history(period="60d", interval="4h")
-                if df is not None and len(df) >= 30:
-                    df.columns = [c.lower() for c in df.columns]
-                    df = df[["open", "high", "low", "close", "volume"]].dropna()
-                    mult = multipliers.get(sym, 1.0)
-                    for col in ["open", "high", "low", "close"]:
-                        df[col] = df[col] * mult
-                    logger.info(f"Gold: fetched {len(df)} candles via {sym} (x{mult})")
-                    return df
-            except Exception as e2:
-                logger.warning(f"Gold {sym} failed: {e2}")
-                continue
-    except ImportError:
-        pass
-
-    # Fallback: CoinGecko XAU via Paxos Gold (PAXG)
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/pax-gold/ohlc?vs_currency=usd&days=30"
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if data and len(data) >= 20:
-            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-            df = df.sort_values("timestamp").reset_index(drop=True)
-            df["volume"] = 0
-            logger.info(f"Gold: fetched {len(df)} candles via PAXG (CoinGecko)")
-            return df
-    except Exception as e3:
-        logger.error(f"Gold PAXG error: {e3}")
-
-    return None
-
-
-def fetch_gold_price() -> float | None:
-    """Get current Gold price (PAXG ≈ XAUUSD)."""
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=pax-gold&vs_currencies=usd"
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        return resp.json()["pax-gold"]["usd"]
+        df = yf.Ticker(symbol).history(period=period, interval=interval)
+        if df is None or len(df) < 5:
+            return None
+        df.columns = [c.lower() for c in df.columns]
+        df = df[["open","high","low","close","volume"]].dropna()
+        if multiplier != 1.0:
+            for c in ["open","high","low","close"]:
+                df[c] = df[c] * multiplier
+        return df
     except Exception as e:
-        logger.error(f"Gold price error: {e}")
-        # Fallback: yfinance
+        logger.warning(f"yfinance {symbol} error: {e}")
+        return None
+
+def live_price(coin_id: str) -> float | None:
+    try:
+        r = requests.get(
+            f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd",
+            timeout=15)
+        r.raise_for_status()
+        return r.json()[coin_id]["usd"]
+    except Exception as e:
+        logger.warning(f"Live price {coin_id}: {e}")
+        return None
+
+def fetch_all_gold():
+    """Fetch gold data for Weekly, Daily, 4H."""
+    # Try CoinGecko PAXG (proxy for gold) — 90 days gives weekly/daily resolution
+    weekly = coingecko_ohlc("pax-gold", 365)
+    daily  = coingecko_ohlc("pax-gold", 90)
+    h4     = coingecko_ohlc("pax-gold", 30)
+
+    # Fallback: yfinance GLD ETF × 10 (≈ XAUUSD)
+    if weekly is None or len(weekly) < 10:
+        weekly = yf_ohlc("GLD", "2y", "1wk", 10.0)
+    if daily is None or len(daily) < 10:
+        daily = yf_ohlc("GLD", "90d", "1d", 10.0)
+    if h4 is None or len(h4) < 10:
+        h4 = yf_ohlc("GLD", "30d", "4h", 10.0) or yf_ohlc("GC=F", "30d", "4h")
+
+    price = live_price("pax-gold")
+    if price is None:
         try:
             import yfinance as yf
-            ticker = yf.Ticker("GLD")
-            hist = ticker.history(period="1d", interval="1h")
+            hist = yf.Ticker("GLD").history(period="1d", interval="1h")
             if hist is not None and len(hist) > 0:
-                return float(hist["Close"].iloc[-1]) * 10.0
+                price = float(hist["Close"].iloc[-1]) * 10.0
         except:
             pass
+
+    return weekly, daily, h4, price
+
+def fetch_all_btc():
+    """Fetch BTC data for Weekly, Daily, 4H."""
+    weekly = coingecko_ohlc("bitcoin", 365)
+    daily  = coingecko_ohlc("bitcoin", 90)
+    h4     = coingecko_ohlc("bitcoin", 30)
+
+    if weekly is None: weekly = yf_ohlc("BTC-USD", "2y", "1wk")
+    if daily  is None: daily  = yf_ohlc("BTC-USD", "90d", "1d")
+    if h4     is None: h4     = yf_ohlc("BTC-USD", "30d", "4h")
+
+    price = live_price("bitcoin")
+    return weekly, daily, h4, price
+
+# ══════════════════════════════════════════════
+# INDICATORS
+# ══════════════════════════════════════════════
+
+def indicators(df: pd.DataFrame, cur_price: float | None = None) -> dict | None:
+    if df is None or len(df) < 14:
         return None
-
-
-# ──────────────────────────────────────────────
-# TECHNICAL INDICATORS
-# ──────────────────────────────────────────────
-
-def compute_indicators(df: pd.DataFrame, current_price: float | None = None) -> dict | None:
-    """Calculate all technical indicators from OHLCV dataframe."""
-    if df is None or len(df) < 20:
-        return None
-
-    close = df["close"]
+    close = df["close"].copy()
     high  = df["high"]
     low   = df["low"]
-
-    if current_price:
-        # Use live price as the last close
-        close = close.copy()
-        close.iloc[-1] = current_price
-
+    if cur_price:
+        close.iloc[-1] = cur_price
     try:
-        rsi_val  = RSIIndicator(close=close, window=14).rsi().iloc[-1]
-        macd_obj = MACD(close=close)
-        macd_val = macd_obj.macd().iloc[-1]
-        macd_sig = macd_obj.macd_signal().iloc[-1]
-        macd_diff= macd_obj.macd_diff().iloc[-1]
-        ema20    = EMAIndicator(close=close, window=min(20, len(close)-1)).ema_indicator().iloc[-1]
-        ema50    = EMAIndicator(close=close, window=min(50, len(close)-1)).ema_indicator().iloc[-1]
-        sma200   = SMAIndicator(close=close, window=min(200, len(close))).sma_indicator().iloc[-1]
-        bb       = BollingerBands(close=close, window=min(20, len(close)-1), window_dev=2)
-        bb_up    = bb.bollinger_hband().iloc[-1]
-        bb_mid   = bb.bollinger_mavg().iloc[-1]
-        bb_low   = bb.bollinger_lband().iloc[-1]
-        bb_pct   = bb.bollinger_pband().iloc[-1]
-        atr      = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range().iloc[-1]
-
-        price      = float(close.iloc[-1])
-        prev_close = float(close.iloc[-2])
-        pct_change = (price - prev_close) / prev_close * 100
-
-        recent_high  = float(high.iloc[-20:].max())
-        recent_low   = float(low.iloc[-20:].min())
-        pivot        = (recent_high + recent_low + price) / 3
-        resistance1  = 2 * pivot - recent_low
-        support1     = 2 * pivot - recent_high
-        resistance2  = pivot + (recent_high - recent_low)
-        support2     = pivot - (recent_high - recent_low)
-
+        n = len(close)
+        rsi  = RSIIndicator(close, 14).rsi().iloc[-1]
+        macd_obj = MACD(close)
+        macd = macd_obj.macd().iloc[-1]
+        msig = macd_obj.macd_signal().iloc[-1]
+        mhist= macd_obj.macd_diff().iloc[-1]
+        e20  = EMAIndicator(close, min(20, n-1)).ema_indicator().iloc[-1]
+        e50  = EMAIndicator(close, min(50, n-1)).ema_indicator().iloc[-1]
+        s200 = SMAIndicator(close, min(200, n)).sma_indicator().iloc[-1]
+        bb   = BollingerBands(close, min(20, n-1), 2)
+        bb_u = bb.bollinger_hband().iloc[-1]
+        bb_m = bb.bollinger_mavg().iloc[-1]
+        bb_l = bb.bollinger_lband().iloc[-1]
+        bb_p = bb.bollinger_pband().iloc[-1]
+        atr  = AverageTrueRange(high, low, close, 14).average_true_range().iloc[-1]
+        price = float(close.iloc[-1])
+        pct   = (price - float(close.iloc[-2])) / float(close.iloc[-2]) * 100
+        rh = float(high.iloc[-20:].max()) if n >= 20 else float(high.max())
+        rl = float(low.iloc[-20:].min())  if n >= 20 else float(low.min())
+        piv = (rh + rl + price) / 3
         return {
-            "price": price, "pct_change": pct_change,
-            "rsi": rsi_val, "macd": macd_val, "macd_sig": macd_sig, "macd_hist": macd_diff,
-            "ema20": ema20, "ema50": ema50, "sma200": sma200,
-            "bb_upper": bb_up, "bb_mid": bb_mid, "bb_lower": bb_low, "bb_pct": bb_pct,
+            "price": price, "pct": pct, "rsi": rsi,
+            "macd": macd, "msig": msig, "mhist": mhist,
+            "e20": e20, "e50": e50, "s200": s200,
+            "bb_u": bb_u, "bb_m": bb_m, "bb_l": bb_l, "bb_p": bb_p,
             "atr": atr,
-            "support1": support1, "support2": support2,
-            "resistance1": resistance1, "resistance2": resistance2,
+            "r2": piv + (rh - rl), "r1": 2*piv - rl,
+            "s1": 2*piv - rh,      "s2": piv - (rh - rl),
         }
     except Exception as e:
         logger.error(f"Indicator error: {e}")
         return None
 
+def tf_bias(ind: dict | None) -> tuple[str, str]:
+    """Return (emoji_bias, short label) for a timeframe."""
+    if ind is None:
+        return "❓", "No data"
+    price, rsi, mhist = ind["price"], ind["rsi"], ind["mhist"]
+    e20, e50, s200    = ind["e20"], ind["e50"], ind["s200"]
+    bull = sum([price > e20, price > e50, price > s200, rsi > 50, mhist > 0])
+    bear = 5 - bull
+    if bull >= 4:   return "📈", "Bullish"
+    elif bull == 3: return "🔼", "Slightly Bullish"
+    elif bear >= 4: return "📉", "Bearish"
+    elif bear == 3: return "🔽", "Slightly Bearish"
+    else:           return "↔️", "Neutral"
 
-# ──────────────────────────────────────────────
-# SIGNAL GENERATOR
-# ──────────────────────────────────────────────
+def signal(ind: dict) -> dict:
+    price, rsi, mhist = ind["price"], ind["rsi"], ind["mhist"]
+    e20, e50, s200, bb_p = ind["e20"], ind["e50"], ind["s200"], ind["bb_p"]
+    b = s = 0
+    if rsi < 35:    b += 2
+    elif rsi > 65:  s += 2
+    elif rsi > 50:  b += 1
+    else:           s += 1
+    b += (1 if mhist > 0 else 0);  s += (0 if mhist > 0 else 1)
+    b += (1 if price > e20  else 0); s += (0 if price > e20  else 1)
+    b += (1 if price > e50  else 0); s += (0 if price > e50  else 1)
+    b += (1 if price > s200 else 0); s += (0 if price > s200 else 1)
+    if bb_p < 0.2: b += 2
+    elif bb_p > 0.8: s += 2
+    total = b + s
+    if total == 0: return {"bias": "NEUTRAL", "str": "WEAK"}
+    if b > s:   return {"bias": "BUY",  "str": "STRONG" if b/total >= 0.7 else "MODERATE"}
+    if s > b:   return {"bias": "SELL", "str": "STRONG" if s/total >= 0.7 else "MODERATE"}
+    return {"bias": "NEUTRAL", "str": "MODERATE"}
 
-def generate_signal(ind: dict) -> dict:
-    buy_points = sell_points = 0
-    reasons = []
-    price, rsi, macd_h = ind["price"], ind["rsi"], ind["macd_hist"]
-    ema20, ema50, sma200, bb_pct = ind["ema20"], ind["ema50"], ind["sma200"], ind["bb_pct"]
-
-    if rsi < 35:
-        buy_points += 2; reasons.append(f"RSI oversold ({rsi:.1f}) — buy opportunity")
-    elif rsi > 65:
-        sell_points += 2; reasons.append(f"RSI overbought ({rsi:.1f}) — sell pressure")
-    elif rsi > 50:
-        buy_points += 1; reasons.append(f"RSI bullish zone ({rsi:.1f})")
-    else:
-        sell_points += 1; reasons.append(f"RSI bearish zone ({rsi:.1f})")
-
-    if macd_h > 0:
-        buy_points += 1; reasons.append("MACD histogram positive (bullish momentum)")
-    else:
-        sell_points += 1; reasons.append("MACD histogram negative (bearish momentum)")
-
-    if price > ema20:
-        buy_points += 1; reasons.append(f"Price above EMA20 (${ema20:,.2f})")
-    else:
-        sell_points += 1; reasons.append(f"Price below EMA20 (${ema20:,.2f})")
-
-    if price > ema50:
-        buy_points += 1; reasons.append(f"Price above EMA50 (${ema50:,.2f})")
-    else:
-        sell_points += 1; reasons.append(f"Price below EMA50 (${ema50:,.2f})")
-
-    if price > sma200:
-        buy_points += 1; reasons.append(f"Price above SMA200 — long-term bullish")
-    else:
-        sell_points += 1; reasons.append(f"Price below SMA200 — long-term bearish")
-
-    if bb_pct < 0.2:
-        buy_points += 2; reasons.append("Near BB lower band — oversold bounce possible")
-    elif bb_pct > 0.8:
-        sell_points += 2; reasons.append("Near BB upper band — overbought, rejection possible")
-
-    total = buy_points + sell_points
-    if total == 0:
-        bias, strength = "NEUTRAL", "WEAK"
-    elif buy_points > sell_points:
-        bias = "BUY"; ratio = buy_points / total
-        strength = "STRONG" if ratio >= 0.7 else "MODERATE"
-    elif sell_points > buy_points:
-        bias = "SELL"; ratio = sell_points / total
-        strength = "STRONG" if ratio >= 0.7 else "MODERATE"
-    else:
-        bias, strength = "NEUTRAL", "MODERATE"
-
-    return {"bias": bias, "strength": strength, "reasons": reasons}
-
-
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # MESSAGE BUILDER
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 
-def build_message(name: str, emoji: str, ind: dict, signal: dict) -> str:
-    """Build a concise summary message for Telegram."""
+def build_report(name: str, emoji: str,
+                 w_ind, d_ind, h4_ind,
+                 price: float | None) -> str:
+
     now_bd = datetime.now(BD_TZ).strftime("%d %b %Y | %I:%M %p")
 
-    bias_map = {
-        "BUY":     "🟢 BUY",
-        "SELL":    "🔴 SELL",
-        "NEUTRAL": "⚪ WAIT",
-    }
-    sig_label = bias_map[signal["bias"]]
-    str_map   = {"STRONG": "🔥", "MODERATE": "⚡", "WEAK": "💤"}
-    str_icon  = str_map.get(signal["strength"], "")
+    # Use 4H as primary for signals
+    primary = h4_ind or d_ind
+    if primary is None:
+        return f"{emoji} *{name}*\n❌ ডেটা পাওয়া যায়নি।"
 
-    chg       = ind["pct_change"]
-    chg_icon  = "📈" if chg >= 0 else "📉"
-    rsi       = ind["rsi"]
-    rsi_icon  = "🔴" if rsi > 70 else "🟢" if rsi < 30 else "🟡"
-    macd_icon = "✅" if ind["macd"] > ind["macd_sig"] else "❌"
-    price     = ind["price"]
-    atr       = ind["atr"]
-    bias      = signal["bias"]
+    if price:
+        primary["price"] = price
 
-    # Compact trade setup
+    sig = signal(primary)
+    cur = primary["price"]
+    pct = primary.get("pct", 0)
+    atr = primary["atr"]
+    chg_icon = "📈" if pct >= 0 else "📉"
+
+    # TF bias
+    w_icon,  w_lbl  = tf_bias(w_ind)
+    d_icon,  d_lbl  = tf_bias(d_ind)
+    h4_icon, h4_lbl = tf_bias(h4_ind)
+
+    # Key levels (use daily if available, else 4H)
+    lev = d_ind or h4_ind
+    r2, r1 = lev["r2"], lev["r1"]
+    s1, s2 = lev["s1"], lev["s2"]
+
+    # Trade setup
+    bias = sig["bias"]
+    str_icon = {"STRONG": "🔥", "MODERATE": "⚡", "WEAK": "💤"}.get(sig["str"], "")
     if bias == "BUY":
-        sl  = price - 1.5 * atr
-        tp1 = price + 1.5 * atr
-        tp2 = price + 2.5 * atr
+        sig_label = "🟢 BUY"
+        sl  = cur - 1.5 * atr
+        tp1 = cur + 1.5 * atr
+        tp2 = cur + 2.5 * atr
+        tp3 = cur + 4.0 * atr
         trade = (
-            f"🟢 *Buy* | SL: `${sl:,.0f}` | TP1: `${tp1:,.0f}` | TP2: `${tp2:,.0f}`"
+            f"🟢 *Buy Setup*\n"
+            f"  Entry: `${cur:,.2f}` | SL: `${sl:,.2f}`\n"
+            f"  TP1: `${tp1:,.2f}` | TP2: `${tp2:,.2f}` | TP3: `${tp3:,.2f}`\n"
+            f"  R:R → 1:1.5 / 1:2.5 / 1:4"
         )
     elif bias == "SELL":
-        sl  = price + 1.5 * atr
-        tp1 = price - 1.5 * atr
-        tp2 = price - 2.5 * atr
+        sig_label = "🔴 SELL"
+        sl  = cur + 1.5 * atr
+        tp1 = cur - 1.5 * atr
+        tp2 = cur - 2.5 * atr
+        tp3 = cur - 4.0 * atr
         trade = (
-            f"🔴 *Sell* | SL: `${sl:,.0f}` | TP1: `${tp1:,.0f}` | TP2: `${tp2:,.0f}`"
+            f"🔴 *Sell Setup*\n"
+            f"  Entry: `${cur:,.2f}` | SL: `${sl:,.2f}`\n"
+            f"  TP1: `${tp1:,.2f}` | TP2: `${tp2:,.2f}` | TP3: `${tp3:,.2f}`\n"
+            f"  R:R → 1:1.5 / 1:2.5 / 1:4"
         )
     else:
-        trade = f"⚪ *Wait* | S: `${ind['support1']:,.0f}` | R: `${ind['resistance1']:,.0f}`"
+        sig_label = "⚪ WAIT"
+        trade = f"⚪ *সিগনাল নেই — অপেক্ষা করুন*\n  Range: `${s1:,.2f}` – `${r1:,.2f}`"
+
+    # RSI info
+    rsi = primary["rsi"]
+    rsi_lbl = "🔴 Overbought" if rsi > 70 else "🟢 Oversold" if rsi < 30 else "🟡 Normal"
 
     msg = (
         f"{emoji} *{name}*\n"
         f"🕐 {now_bd} (BST)\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"💰 `${price:,.2f}` {chg_icon} `{chg:+.2f}%`\n\n"
-        f"📊 RSI: {rsi_icon}`{rsi:.0f}` | MACD: {macd_icon} | ATR: `{atr:,.0f}`\n"
-        f"📐 EMA20: `{ind['ema20']:,.0f}` | EMA50: `{ind['ema50']:,.0f}`\n\n"
-        f"🔑 R1:`${ind['resistance1']:,.0f}` | S1:`${ind['support1']:,.0f}`\n"
-        f"   R2:`${ind['resistance2']:,.0f}` | S2:`${ind['support2']:,.0f}`\n\n"
-        f"🎯 *{sig_label}* {str_icon}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"💰 *মূল্য:* `${cur:,.2f}` {chg_icon} `{pct:+.2f}%`\n"
+        f"\n"
+        f"📊 *মাল্টি-টাইমফ্রেম বায়াস:*\n"
+        f"  🗓 Weekly:  {w_icon} {w_lbl}\n"
+        f"  📅 Daily:   {d_icon} {d_lbl}\n"
+        f"  ⏱ 4H:      {h4_icon} {h4_lbl}\n"
+        f"\n"
+        f"📐 *ইন্ডিকেটর (4H):*\n"
+        f"  RSI: `{rsi:.0f}` {rsi_lbl}\n"
+        f"  EMA20: `{primary['e20']:,.0f}` | EMA50: `{primary['e50']:,.0f}`\n"
+        f"\n"
+        f"🔑 *কী লেভেল:*\n"
+        f"  🔴 R2: `${r2:,.2f}` | R1: `${r1:,.2f}`\n"
+        f"  ◀ Now: `${cur:,.2f}`\n"
+        f"  🟢 S1: `${s1:,.2f}` | S2: `${s2:,.2f}`\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 *সিগনাল: {sig_label}* {str_icon}\n"
+        f"\n"
         f"{trade}\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"⚠️ _শিক্ষামূলক বিশ্লেষণ মাত্র_"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ _শিক্ষামূলক বিশ্লেষণ। ট্রেডের আগে নিজস্ব যাচাই করুন।_"
     )
     return msg
 
-
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # TELEGRAM
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 
-def send_telegram(message: str) -> bool:
+def send_telegram(msg: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+        logger.error("Missing Telegram credentials!")
         return False
     url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {
-        "chat_id":    TELEGRAM_CHAT_ID,
-        "text":       message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg,
+            "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
-        resp = requests.post(url, json=data, timeout=30)
-        resp.raise_for_status()
-        logger.info("Telegram message sent!")
+        r = requests.post(url, json=data, timeout=30)
+        r.raise_for_status()
+        logger.info("Telegram sent!")
         return True
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"Telegram HTTP error: {e.response.text}")
+    except requests.HTTPError as e:
+        logger.error(f"Telegram HTTP: {e.response.text}")
         return False
     except Exception as e:
-        logger.error(f"Telegram error: {e}")
+        logger.error(f"Telegram: {e}")
         return False
 
-
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # MAIN
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 
 def main():
     logger.info("Market Analysis Bot starting...")
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Missing environment variables!")
-        sys.exit(1)
+        logger.error("Missing env vars!"); sys.exit(1)
 
     now_bd = datetime.now(BD_TZ).strftime("%d %b %Y | %I:%M %p")
     send_telegram(
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 *Automated Market Report*\n"
         f"🕐 {now_bd} (BST)\n"
-        f"BTC & Gold analysis below 👇\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
+        f"Gold & BTC বিশ্লেষণ নিচে 👇\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
-    results = []
-
     # ── GOLD ──
-    logger.info("Fetching Gold data...")
-    gold_df    = fetch_gold_ohlc()
-    gold_price = fetch_gold_price()
-    gold_ind   = compute_indicators(gold_df, gold_price)
-
-    if gold_ind:
-        gold_signal = generate_signal(gold_ind)
-        gold_msg    = build_message("Gold (XAUUSD)", "🥇", gold_ind, gold_signal)
-        results.append(send_telegram(gold_msg))
-        logger.info(f"Gold: ${gold_ind['price']:,.2f} | {gold_signal['bias']} {gold_signal['strength']}")
-    else:
-        send_telegram("❌ Gold: Could not fetch market data. Will retry next session.")
-        results.append(False)
+    logger.info("Fetching Gold...")
+    gw, gd, gh4, gprice = fetch_all_gold()
+    gw_ind  = indicators(gw)
+    gd_ind  = indicators(gd)
+    gh4_ind = indicators(gh4, gprice)
+    gold_msg = build_report("Gold (XAUUSD)", "🥇", gw_ind, gd_ind, gh4_ind, gprice)
+    gold_ok = send_telegram(gold_msg)
+    if gprice: logger.info(f"Gold: ${gprice:,.2f}")
 
     # ── BTC ──
-    logger.info("Fetching BTC data...")
-    btc_df    = fetch_btc_ohlc(days=30)
-    btc_price = fetch_btc_price()
-    btc_ind   = compute_indicators(btc_df, btc_price)
+    logger.info("Fetching BTC...")
+    bw, bd, bh4, bprice = fetch_all_btc()
+    bw_ind  = indicators(bw)
+    bd_ind  = indicators(bd)
+    bh4_ind = indicators(bh4, bprice)
+    btc_msg = build_report("Bitcoin (BTC/USD)", "₿", bw_ind, bd_ind, bh4_ind, bprice)
+    btc_ok = send_telegram(btc_msg)
+    if bprice: logger.info(f"BTC: ${bprice:,.2f}")
 
-    if btc_ind:
-        btc_signal = generate_signal(btc_ind)
-        btc_msg    = build_message("Bitcoin (BTC/USD)", "₿", btc_ind, btc_signal)
-        results.append(send_telegram(btc_msg))
-        logger.info(f"BTC: ${btc_ind['price']:,.2f} | {btc_signal['bias']} {btc_signal['strength']}")
-    else:
-        send_telegram("❌ BTC: Could not fetch market data. Will retry next session.")
-        results.append(False)
-
-    if all(results):
-        logger.info("All reports sent successfully!")
+    if gold_ok and btc_ok:
+        logger.info("All reports sent!")
     else:
         logger.warning("Some reports failed.")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
