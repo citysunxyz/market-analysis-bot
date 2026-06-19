@@ -42,23 +42,40 @@ PAIRS = {
 # ══════════════════════════════════════════════
 
 def yf_fetch(symbol: str, period: str, interval: str) -> pd.DataFrame | None:
-    """Fallback: fetch from yfinance"""
+    """Primary: fetch directly from Yahoo Finance API to bypass yfinance library blocks."""
     try:
-        import yfinance as yf
         import requests
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
-        df = yf.Ticker(symbol, session=session).history(period=period, interval=interval)
-        if df is None or len(df) < 5:
-            logger.warning(f"yf {symbol} {interval}: Data empty or less than 5 rows. Rows: {len(df) if df is not None else 0}")
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={period}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "application/json"
+        }
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code != 200:
+            logger.warning(f"yf_raw {symbol} {interval}: Status {res.status_code}")
             return None
-        df.columns = [c.lower() for c in df.columns]
-        df = df[["open","high","low","close","volume"]].dropna()
+            
+        data = res.json()["chart"]["result"][0]
+        if "timestamp" not in data:
+            return None
+            
+        timestamps = data["timestamp"]
+        quotes = data["indicators"]["quote"][0]
+        
+        df = pd.DataFrame({
+            "open": quotes.get("open", []),
+            "high": quotes.get("high", []),
+            "low": quotes.get("low", []),
+            "close": quotes.get("close", []),
+            "volume": quotes.get("volume", [0]*len(timestamps))
+        })
+        # Set index
+        df.index = pd.to_datetime(timestamps, unit='s')
+        df = df.dropna()
+        if len(df) < 5: return None
         return df
     except Exception as e:
-        logger.warning(f"yf {symbol} {interval}: Exception {e}")
+        logger.warning(f"yf_raw {symbol} {interval}: {e}")
         return None
 
 def get_ohlcv(pair: str, tf: str) -> pd.DataFrame | None:
