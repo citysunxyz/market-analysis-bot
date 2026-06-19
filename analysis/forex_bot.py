@@ -45,13 +45,20 @@ def yf_fetch(symbol: str, period: str, interval: str) -> pd.DataFrame | None:
     """Fallback: fetch from yfinance"""
     try:
         import yfinance as yf
-        df = yf.Ticker(symbol).history(period=period, interval=interval)
-        if df is None or len(df) < 5: return None
+        import requests
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        df = yf.Ticker(symbol, session=session).history(period=period, interval=interval)
+        if df is None or len(df) < 5:
+            logger.warning(f"yf {symbol} {interval}: Data empty or less than 5 rows. Rows: {len(df) if df is not None else 0}")
+            return None
         df.columns = [c.lower() for c in df.columns]
         df = df[["open","high","low","close","volume"]].dropna()
         return df
     except Exception as e:
-        logger.warning(f"yf {symbol} {interval}: {e}")
+        logger.warning(f"yf {symbol} {interval}: Exception {e}")
         return None
 
 def get_ohlcv(pair: str, tf: str) -> pd.DataFrame | None:
