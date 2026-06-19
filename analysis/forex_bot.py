@@ -13,12 +13,7 @@ import pytz
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Optional tvdatafeed
-try:
-    from tvDatafeed import TvDatafeed, Interval
-    tv = TvDatafeed()  # Anonymous
-except:
-    tv = None
+# tvdatafeed removed due to PyPI/Cloudflare issues. Using yfinance as primary source.
 
 from ta.trend import MACD, EMAIndicator, SMAIndicator
 from ta.momentum import RSIIndicator
@@ -59,21 +54,6 @@ def yf_fetch(symbol: str, period: str, interval: str) -> pd.DataFrame | None:
         logger.warning(f"yf {symbol} {interval}: {e}")
         return None
 
-def tv_fetch(symbol: str, interval_enum, n_bars: int) -> pd.DataFrame | None:
-    """Primary: fetch from TradingView (FOREXCOM or OANDA)"""
-    if tv is None: return None
-    try:
-        df = tv.get_hist(symbol=symbol, exchange='FOREXCOM', interval=interval_enum, n_bars=n_bars)
-        if df is None or len(df) < 5:
-            df = tv.get_hist(symbol=symbol, exchange='OANDA', interval=interval_enum, n_bars=n_bars)
-        if df is None or len(df) < 5: return None
-        df.index.name = "ts"
-        df = df.reset_index()
-        return df[["open","high","low","close","volume"]].dropna()
-    except Exception as e:
-        logger.warning(f"tv {symbol} {interval_enum}: {e}")
-        return None
-
 def get_ohlcv(pair: str, tf: str) -> pd.DataFrame | None:
     """Fetch OHLCV based on timeframe."""
     info = PAIRS[pair]
@@ -81,23 +61,21 @@ def get_ohlcv(pair: str, tf: str) -> pd.DataFrame | None:
     
     # Mapping
     if tf == "weekly":
-        if tv: df = tv_fetch(info["tv"], Interval.in_weekly, 52)
-        if df is None: df = yf_fetch(info["yf"], "2y", "1wk")
+        df = yf_fetch(info["yf"], "2y", "1wk")
     elif tf == "daily":
-        if tv: df = tv_fetch(info["tv"], Interval.in_daily, 60)
-        if df is None: df = yf_fetch(info["yf"], "90d", "1d")
+        df = yf_fetch(info["yf"], "90d", "1d")
     elif tf == "4h":
-        if tv: df = tv_fetch(info["tv"], Interval.in_4_hour, 100)
-        if df is None: df = yf_fetch(info["yf"], "30d", "1h") # yfinance 4h is buggy, use 1h resample or just fetch
-        if df is not None and len(df) > 10 and tf == "4h" and "1h" in str(df.index):
-            # rudimentary fallback if yf 4h fails
-            pass 
+        # yfinance doesn't natively support robust 4h interval for all assets easily
+        # "1h" used as substitute or fetch 1h and resample
+        df = yf_fetch(info["yf"], "30d", "1h") 
+        if df is not None:
+            df = df.resample("4h").agg({
+                "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
+            }).dropna()
     elif tf == "1h":
-        if tv: df = tv_fetch(info["tv"], Interval.in_1_hour, 100)
-        if df is None: df = yf_fetch(info["yf"], "7d", "1h")
+        df = yf_fetch(info["yf"], "7d", "1h")
     elif tf == "15m":
-        if tv: df = tv_fetch(info["tv"], Interval.in_15_minute, 100)
-        if df is None: df = yf_fetch(info["yf"], "3d", "15m")
+        df = yf_fetch(info["yf"], "3d", "15m")
         
     if df is not None:
         logger.info(f"{pair} {tf}: {len(df)} rows")
