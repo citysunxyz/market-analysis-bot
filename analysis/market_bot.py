@@ -160,6 +160,35 @@ def fetch_news(asset: str) -> list[str]:
     return news
 
 
+def analyze_news_sentiment(news_list: list[str], asset: str) -> dict:
+    """Analyze news headlines to determine fundamental bias."""
+    if not news_list:
+        return {"bias": "MIXED", "text": "⚪ নিউজের প্রভাব অস্পষ্ট।"}
+    
+    text = " ".join(news_list).lower()
+    bull_score = 0
+    bear_score = 0
+    
+    if asset == "GOLD":
+        bull_words = ["cut", "weak", "dovish", "surge", "jump", "high", "war", "tension", "inflation", "stimulus", "gain", "up"]
+        bear_words = ["hike", "strong", "hawkish", "drop", "fall", "low", "peak", "crash", "bear", "plunge", "steady", "down"]
+    else:
+        bull_words = ["adopt", "approve", "etf", "surge", "jump", "high", "bull", "rally", "integrate", "upgrade", "buy", "gain"]
+        bear_words = ["ban", "hack", "crash", "drop", "fall", "crackdown", "reject", "sell", "hawkish", "scam", "regulation", "bear"]
+        
+    for w in bull_words:
+        if w in text: bull_score += 1
+    for w in bear_words:
+        if w in text: bear_score += 1
+        
+    if bull_score > bear_score:
+        return {"bias": "BULLISH", "text": "🟢 ফান্ডামেন্টাল নিউজ অনুযায়ী মার্কেট **উপরের দিকে (Bullish)** যেতে পারে।"}
+    elif bear_score > bull_score:
+        return {"bias": "BEARISH", "text": "🔴 ফান্ডামেন্টাল নিউজ অনুযায়ী মার্কেট **নিচের দিকে (Bearish)** যেতে পারে।"}
+    else:
+        return {"bias": "MIXED", "text": "⚪ নিউজগুলো মিক্সড, মার্কেটে **ভোলাটিলিটি (উঠা-নামা)** দেখা যেতে পারে।"}
+
+
 # ── Fetch helpers ──────────────────────────
 
 def fetch_daily_data(asset: str) -> dict:
@@ -328,13 +357,16 @@ def build_daily_bias(name: str, emoji: str, data: dict) -> str:
     w_rsi = f"`{w_ind['rsi']:.0f}`" if w_ind else "N/A"
     d_rsi = f"`{d_ind['rsi']:.0f}`" if d_ind else "N/A"
 
-    news_list = fetch_news("GOLD" if "Gold" in name else "BTC")
+    asset_key = "GOLD" if "Gold" in name else "BTC"
+    news_list = fetch_news(asset_key)
     news_text = ""
     if news_list:
+        sentiment = analyze_news_sentiment(news_list, asset_key)
         news_text = "\n📰 *ফান্ডামেন্টাল আপডেট (Live):*\n"
         for n in news_list:
             news_text += f"🔹 {n}\n"
-        news_text += f"\n💡 *ওভারঅল ভিউ:* টেকনিক্যাল অনুযায়ী মার্কেট {bias_txt[bias]}, তবে উপরোক্ত ফান্ডামেন্টাল নিউজ সাময়িক ভোলাটিলিটি (উঠা-নামা) তৈরি করতে পারে।\n"
+        news_text += f"\n💡 *ফান্ডামেন্টাল বায়াস:* {sentiment['text']}\n"
+        news_text += f"⚖️ *ওভারঅল ভিউ:* টেকনিক্যাল অনুযায়ী {bias_txt[bias]}, এবং ফান্ডামেন্টাল অনুযায়ী {sentiment['bias']}।\n"
 
     return (
         f"{emoji} *{name}*\n"
@@ -396,13 +428,16 @@ def build_intraday(name: str, emoji: str, data: dict) -> str:
     else:
         trade = f"⚪ *অপেক্ষা করুন* | S: `${primary['s1']:,.2f}` – R: `${primary['r1']:,.2f}`"
 
-    news_list = fetch_news("GOLD" if "Gold" in name else "BTC")
+    asset_key = "GOLD" if "Gold" in name else "BTC"
+    news_list = fetch_news(asset_key)
     news_text = ""
     if news_list:
+        sentiment = analyze_news_sentiment(news_list, asset_key)
         news_text = "\n📰 *ফান্ডামেন্টাল আপডেট (Live):*\n"
         for n in news_list:
             news_text += f"🔹 {n}\n"
-        news_text += f"\n💡 *ওভারঅল ভিউ:* টেকনিক্যাল সিগন্যাল {sl}, তবে নিউজ ইমপ্যাক্ট মাথায় রেখে ট্রেড ম্যানেজ করুন।\n"
+        news_text += f"\n💡 *ফান্ডামেন্টাল বায়াস:* {sentiment['text']}\n"
+        news_text += f"⚖️ *ওভারঅল ভিউ:* টেকনিক্যাল সিগন্যাল {sl}, এবং ফান্ডামেন্টাল অনুযায়ী {sentiment['bias']}।\n"
 
     return (
         f"{emoji} *{name}* — ইন্ট্রাডে\n"
