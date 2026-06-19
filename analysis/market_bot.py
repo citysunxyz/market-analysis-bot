@@ -7,7 +7,8 @@ BTC & Gold Market Analysis Telegram Bot
 Data: CoinGecko free API (no key needed)
 """
 
-import os, sys, logging, requests, time
+import os, sys, logging, requests, time, urllib.request
+import xml.etree.ElementTree as ET
 import pandas as pd
 import pytz
 from datetime import datetime
@@ -131,6 +132,32 @@ def yf_fallback(symbol: str, period: str, interval: str,
     except Exception as e:
         logger.warning(f"yf {symbol}: {e}")
         return None
+
+def fetch_news(asset: str) -> list[str]:
+    """Fetch top 3 fundamental news headlines using RSS."""
+    news = []
+    try:
+        if asset == "GOLD":
+            # CNBC Market News
+            url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000115"
+        else:
+            # CoinTelegraph Bitcoin News
+            url = "https://cointelegraph.com/rss"
+        
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            xml_data = response.read()
+        
+        root = ET.fromstring(xml_data)
+        for item in root.findall('.//item')[:3]:
+            title_elem = item.find('title')
+            if title_elem is not None and title_elem.text:
+                news.append(title_elem.text.strip())
+                
+    except Exception as e:
+        logger.warning(f"News fetch error for {asset}: {e}")
+    
+    return news
 
 
 # ── Fetch helpers ──────────────────────────
@@ -301,6 +328,14 @@ def build_daily_bias(name: str, emoji: str, data: dict) -> str:
     w_rsi = f"`{w_ind['rsi']:.0f}`" if w_ind else "N/A"
     d_rsi = f"`{d_ind['rsi']:.0f}`" if d_ind else "N/A"
 
+    news_list = fetch_news("GOLD" if "Gold" in name else "BTC")
+    news_text = ""
+    if news_list:
+        news_text = "\n📰 *ফান্ডামেন্টাল আপডেট (Live):*\n"
+        for n in news_list:
+            news_text += f"🔹 {n}\n"
+        news_text += f"\n💡 *ওভারঅল ভিউ:* টেকনিক্যাল অনুযায়ী মার্কেট {bias_txt[bias]}, তবে উপরোক্ত ফান্ডামেন্টাল নিউজ সাময়িক ভোলাটিলিটি (উঠা-নামা) তৈরি করতে পারে।\n"
+
     return (
         f"{emoji} *{name}*\n"
         f"🌅 *দৈনিক বায়াস — {now_bd}*\n"
@@ -317,8 +352,9 @@ def build_daily_bias(name: str, emoji: str, data: dict) -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 *আজকের বায়াস: {bias_txt[bias]}*\n"
         f"{advice[bias]}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ _শিক্ষামূলক বিশ্লেষণ। স্টপ লস ব্যবহার করুন।_"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+        f"{news_text}"
+        f"\n⚠️ _শিক্ষামূলক বিশ্লেষণ। স্টপ লস ব্যবহার করুন।_"
     )
 
 
@@ -360,6 +396,14 @@ def build_intraday(name: str, emoji: str, data: dict) -> str:
     else:
         trade = f"⚪ *অপেক্ষা করুন* | S: `${primary['s1']:,.2f}` – R: `${primary['r1']:,.2f}`"
 
+    news_list = fetch_news("GOLD" if "Gold" in name else "BTC")
+    news_text = ""
+    if news_list:
+        news_text = "\n📰 *ফান্ডামেন্টাল আপডেট (Live):*\n"
+        for n in news_list:
+            news_text += f"🔹 {n}\n"
+        news_text += f"\n💡 *ওভারঅল ভিউ:* টেকনিক্যাল সিগন্যাল {sl}, তবে নিউজ ইমপ্যাক্ট মাথায় রেখে ট্রেড ম্যানেজ করুন।\n"
+
     return (
         f"{emoji} *{name}* — ইন্ট্রাডে\n"
         f"🕐 {now_bd} (BST)\n"
@@ -372,8 +416,9 @@ def build_intraday(name: str, emoji: str, data: dict) -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 *সিগনাল: {sl}* {si}\n"
         f"{trade}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ _শিক্ষামূলক বিশ্লেষণ মাত্র।_"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+        f"{news_text}"
+        f"\n⚠️ _শিক্ষামূলক বিশ্লেষণ মাত্র।_"
     )
 
 
