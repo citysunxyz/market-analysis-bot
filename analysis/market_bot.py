@@ -262,84 +262,58 @@ def generate_signal(ind: dict) -> dict:
 # ──────────────────────────────────────────────
 
 def build_message(name: str, emoji: str, ind: dict, signal: dict) -> str:
+    """Build a concise summary message for Telegram."""
     now_bd = datetime.now(BD_TZ).strftime("%d %b %Y | %I:%M %p")
+
     bias_map = {
-        "BUY":     ("🟢 BUY",  "📈 Bullish"),
-        "SELL":    ("🔴 SELL", "📉 Bearish"),
-        "NEUTRAL": ("⚪ WAIT", "↔️ Neutral"),
+        "BUY":     "🟢 BUY",
+        "SELL":    "🔴 SELL",
+        "NEUTRAL": "⚪ WAIT",
     }
-    sig_label, bias_label = bias_map[signal["bias"]]
-    str_map = {"STRONG": "🔥 Strong", "MODERATE": "⚡ Moderate", "WEAK": "💤 Weak"}
-    strength_label = str_map.get(signal["strength"], "")
-    chg = ind["pct_change"]
-    chg_icon = "📈" if chg >= 0 else "📉"
-    rsi = ind["rsi"]
-    rsi_label = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Normal"
-    macd_label = "✅ Bullish crossover" if ind["macd"] > ind["macd_sig"] else "❌ Bearish crossover"
+    sig_label = bias_map[signal["bias"]]
+    str_map   = {"STRONG": "🔥", "MODERATE": "⚡", "WEAK": "💤"}
+    str_icon  = str_map.get(signal["strength"], "")
 
-    price = ind["price"]
-    atr   = ind["atr"]
-    bias  = signal["bias"]
+    chg       = ind["pct_change"]
+    chg_icon  = "📈" if chg >= 0 else "📉"
+    rsi       = ind["rsi"]
+    rsi_icon  = "🔴" if rsi > 70 else "🟢" if rsi < 30 else "🟡"
+    macd_icon = "✅" if ind["macd"] > ind["macd_sig"] else "❌"
+    price     = ind["price"]
+    atr       = ind["atr"]
+    bias      = signal["bias"]
 
+    # Compact trade setup
     if bias == "BUY":
-        sl, tp1, tp2, tp3 = price - 1.5*atr, price + 1.5*atr, price + 2.5*atr, price + 4.0*atr
+        sl  = price - 1.5 * atr
+        tp1 = price + 1.5 * atr
+        tp2 = price + 2.5 * atr
         trade = (
-            f"🟢 *Long (Buy) Setup*\n"
-            f"  ├ Entry: `${price:,.2f}`\n"
-            f"  ├ Stop Loss: `${sl:,.2f}`\n"
-            f"  ├ TP1: `${tp1:,.2f}` R:R=1:1.5\n"
-            f"  ├ TP2: `${tp2:,.2f}` R:R=1:2.5\n"
-            f"  └ TP3: `${tp3:,.2f}` R:R=1:4"
+            f"🟢 *Buy* | SL: `${sl:,.0f}` | TP1: `${tp1:,.0f}` | TP2: `${tp2:,.0f}`"
         )
     elif bias == "SELL":
-        sl, tp1, tp2, tp3 = price + 1.5*atr, price - 1.5*atr, price - 2.5*atr, price - 4.0*atr
+        sl  = price + 1.5 * atr
+        tp1 = price - 1.5 * atr
+        tp2 = price - 2.5 * atr
         trade = (
-            f"🔴 *Short (Sell) Setup*\n"
-            f"  ├ Entry: `${price:,.2f}`\n"
-            f"  ├ Stop Loss: `${sl:,.2f}`\n"
-            f"  ├ TP1: `${tp1:,.2f}` R:R=1:1.5\n"
-            f"  ├ TP2: `${tp2:,.2f}` R:R=1:2.5\n"
-            f"  └ TP3: `${tp3:,.2f}` R:R=1:4"
+            f"🔴 *Sell* | SL: `${sl:,.0f}` | TP1: `${tp1:,.0f}` | TP2: `${tp2:,.0f}`"
         )
     else:
-        trade = (
-            f"⚪ *Neutral — Wait for setup*\n"
-            f"  ├ Support: `${ind['support1']:,.2f}`\n"
-            f"  └ Resistance: `${ind['resistance1']:,.2f}`"
-        )
-
-    reasons_text = "\n".join([f"  • {r}" for r in signal["reasons"][:5]])
+        trade = f"⚪ *Wait* | S: `${ind['support1']:,.0f}` | R: `${ind['resistance1']:,.0f}`"
 
     msg = (
-        f"{emoji} *{name} — Market Analysis*\n"
-        f"🕐 *Time:* {now_bd} (BST)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 *Current Price:* `${ind['price']:,.2f}`\n"
-        f"{chg_icon} *Change:* `{chg:+.2f}%`\n\n"
-        f"📊 *Technical Indicators*\n"
-        f"  ├ RSI(14): `{rsi:.1f}` — {rsi_label}\n"
-        f"  ├ MACD: {macd_label}\n"
-        f"  ├ EMA20: `${ind['ema20']:,.2f}`\n"
-        f"  ├ EMA50: `${ind['ema50']:,.2f}`\n"
-        f"  └ SMA200: `${ind['sma200']:,.2f}`\n\n"
-        f"📐 *Bollinger Bands*\n"
-        f"  ├ 🔴 Upper: `${ind['bb_upper']:,.2f}`\n"
-        f"  ├ ⚪ Mid:   `${ind['bb_mid']:,.2f}`\n"
-        f"  └ 🟢 Lower: `${ind['bb_lower']:,.2f}`\n\n"
-        f"🔑 *Key Levels*\n"
-        f"  ├ 🔴 R2: `${ind['resistance2']:,.2f}`\n"
-        f"  ├ 🔴 R1: `${ind['resistance1']:,.2f}`\n"
-        f"  ├ ◀ Now: `${ind['price']:,.2f}`\n"
-        f"  ├ 🟢 S1: `${ind['support1']:,.2f}`\n"
-        f"  └ 🟢 S2: `${ind['support2']:,.2f}`\n\n"
-        f"⚡ *ATR (Volatility):* `${ind['atr']:,.2f}`\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 *Signal: {sig_label}* | {strength_label}\n\n"
-        f"📋 *Reasons:*\n{reasons_text}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} *{name}*\n"
+        f"🕐 {now_bd} (BST)\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"💰 `${price:,.2f}` {chg_icon} `{chg:+.2f}%`\n\n"
+        f"📊 RSI: {rsi_icon}`{rsi:.0f}` | MACD: {macd_icon} | ATR: `{atr:,.0f}`\n"
+        f"📐 EMA20: `{ind['ema20']:,.0f}` | EMA50: `{ind['ema50']:,.0f}`\n\n"
+        f"🔑 R1:`${ind['resistance1']:,.0f}` | S1:`${ind['support1']:,.0f}`\n"
+        f"   R2:`${ind['resistance2']:,.0f}` | S2:`${ind['support2']:,.0f}`\n\n"
+        f"🎯 *{sig_label}* {str_icon}\n"
         f"{trade}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ _Educational analysis only. Always use risk management._"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"⚠️ _শিক্ষামূলক বিশ্লেষণ মাত্র_"
     )
     return msg
 
