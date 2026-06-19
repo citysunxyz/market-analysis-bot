@@ -5,7 +5,7 @@ BTC & Gold Market Analysis Telegram Bot
 Multi-timeframe analysis with key levels and trade setups.
 """
 
-import os, sys, logging, requests
+import os, sys, logging, requests, time
 import numpy as np
 import pandas as pd
 import pytz
@@ -28,23 +28,31 @@ BD_TZ = pytz.timezone("Asia/Dhaka")
 # DATA FETCHING
 # ══════════════════════════════════════════════
 
-def coingecko_ohlc(coin_id: str, days: int) -> pd.DataFrame | None:
-    """Fetch OHLC from CoinGecko free API."""
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if not data or len(data) < 5:
-            return None
-        df = pd.DataFrame(data, columns=["ts","open","high","low","close"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-        df = df.sort_values("ts").reset_index(drop=True)
-        df["volume"] = 0
-        return df
-    except Exception as e:
-        logger.warning(f"CoinGecko {coin_id} {days}d error: {e}")
-        return None
+def coingecko_ohlc(coin_id: str, days: int, retries: int = 3) -> pd.DataFrame | None:
+    """Fetch OHLC from CoinGecko free API with retry."""
+    for attempt in range(retries):
+        try:
+            url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
+            r = requests.get(url, timeout=30)
+            if r.status_code == 429:  # Rate limit
+                wait = 10 * (attempt + 1)
+                logger.warning(f"CoinGecko rate limit. Waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if not data or len(data) < 5:
+                return None
+            df = pd.DataFrame(data, columns=["ts","open","high","low","close"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            df = df.sort_values("ts").reset_index(drop=True)
+            df["volume"] = 0
+            logger.info(f"CoinGecko {coin_id} {days}d: {len(df)} rows")
+            return df
+        except Exception as e:
+            logger.warning(f"CoinGecko {coin_id} {days}d attempt {attempt+1}: {e}")
+            time.sleep(3)
+    return None
 
 def yf_ohlc(symbol: str, period: str, interval: str, multiplier: float = 1.0) -> pd.DataFrame | None:
     """Fetch OHLC from yfinance."""
@@ -64,22 +72,34 @@ def yf_ohlc(symbol: str, period: str, interval: str, multiplier: float = 1.0) ->
         return None
 
 def live_price(coin_id: str) -> float | None:
-    try:
-        r = requests.get(
-            f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd",
-            timeout=15)
-        r.raise_for_status()
-        return r.json()[coin_id]["usd"]
-    except Exception as e:
-        logger.warning(f"Live price {coin_id}: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd",
+                timeout=15)
+            if r.status_code == 429:
+                time.sleep(10)
+                continue
+            r.raise_for_status()
+            price = r.json()[coin_id]["usd"]
+            logger.info(f"Live price {coin_id}: ${price:,.2f}")
+            return price
+        except Exception as e:
+            logger.warning(f"Live price {coin_id} attempt {attempt+1}: {e}")
+            time.sleep(3)
+    return None
 
 def fetch_all_gold():
     """Fetch gold data for Weekly, Daily, 4H."""
-    # Try CoinGecko PAXG (proxy for gold) — 90 days gives weekly/daily resolution
+    logger.info("Fetching Gold weekly data...")
     weekly = coingecko_ohlc("pax-gold", 365)
+    time.sleep(2)
+    logger.info("Fetching Gold daily data...")
     daily  = coingecko_ohlc("pax-gold", 90)
+    time.sleep(2)
+    logger.info("Fetching Gold 4H data...")
     h4     = coingecko_ohlc("pax-gold", 30)
+    time.sleep(2)
 
     # Fallback: yfinance GLD ETF × 10 (≈ XAUUSD)
     if weekly is None or len(weekly) < 10:
@@ -90,6 +110,7 @@ def fetch_all_gold():
         h4 = yf_ohlc("GLD", "30d", "4h", 10.0) or yf_ohlc("GC=F", "30d", "4h")
 
     price = live_price("pax-gold")
+    time.sleep(2)
     if price is None:
         try:
             import yfinance as yf
@@ -99,19 +120,28 @@ def fetch_all_gold():
         except:
             pass
 
+    logger.info(f"Gold data: weekly={len(weekly) if weekly is not None else 0}, daily={len(daily) if daily is not None else 0}, 4H={len(h4) if h4 is not None else 0}, price={price}")
     return weekly, daily, h4, price
 
 def fetch_all_btc():
     """Fetch BTC data for Weekly, Daily, 4H."""
+    logger.info("Fetching BTC weekly data...")
     weekly = coingecko_ohlc("bitcoin", 365)
+    time.sleep(3)  # Extra sleep to avoid rate limits after Gold
+    logger.info("Fetching BTC daily data...")
     daily  = coingecko_ohlc("bitcoin", 90)
+    time.sleep(2)
+    logger.info("Fetching BTC 4H data...")
     h4     = coingecko_ohlc("bitcoin", 30)
+    time.sleep(2)
 
-    if weekly is None: weekly = yf_ohlc("BTC-USD", "2y", "1wk")
-    if daily  is None: daily  = yf_ohlc("BTC-USD", "90d", "1d")
-    if h4     is None: h4     = yf_ohlc("BTC-USD", "30d", "4h")
+    if weekly is None or len(weekly) < 10: weekly = yf_ohlc("BTC-USD", "2y", "1wk")
+    if daily  is None or len(daily)  < 10: daily  = yf_ohlc("BTC-USD", "90d", "1d")
+    if h4     is None or len(h4)     < 10: h4     = yf_ohlc("BTC-USD", "30d", "4h")
 
     price = live_price("bitcoin")
+    time.sleep(2)
+    logger.info(f"BTC data: weekly={len(weekly) if weekly is not None else 0}, daily={len(daily) if daily is not None else 0}, 4H={len(h4) if h4 is not None else 0}, price={price}")
     return weekly, daily, h4, price
 
 # ══════════════════════════════════════════════
@@ -336,24 +366,24 @@ def main():
     )
 
     # ── GOLD ──
-    logger.info("Fetching Gold...")
     gw, gd, gh4, gprice = fetch_all_gold()
     gw_ind  = indicators(gw)
     gd_ind  = indicators(gd)
     gh4_ind = indicators(gh4, gprice)
     gold_msg = build_report("Gold (XAUUSD)", "🥇", gw_ind, gd_ind, gh4_ind, gprice)
     gold_ok = send_telegram(gold_msg)
-    if gprice: logger.info(f"Gold: ${gprice:,.2f}")
+
+    # Wait before BTC to respect rate limits
+    logger.info("Waiting 5s before BTC fetch...")
+    time.sleep(5)
 
     # ── BTC ──
-    logger.info("Fetching BTC...")
     bw, bd, bh4, bprice = fetch_all_btc()
     bw_ind  = indicators(bw)
     bd_ind  = indicators(bd)
     bh4_ind = indicators(bh4, bprice)
     btc_msg = build_report("Bitcoin (BTC/USD)", "₿", bw_ind, bd_ind, bh4_ind, bprice)
     btc_ok = send_telegram(btc_msg)
-    if bprice: logger.info(f"BTC: ${bprice:,.2f}")
 
     if gold_ok and btc_ok:
         logger.info("All reports sent!")
