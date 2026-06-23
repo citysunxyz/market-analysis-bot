@@ -33,8 +33,9 @@ UTC_TZ = pytz.utc
 # ══════════════════════════════════════════════
 
 def is_daily_opening() -> bool:
-    """True at 00:xx UTC = 06:00 AM BST (daily opening report)."""
-    return datetime.now(UTC_TZ).hour == 0
+    """True at 00:xx UTC = 06:00 AM BST (daily opening report). 
+    Allowing up to 03:00 UTC in case GitHub Actions is delayed."""
+    return datetime.now(UTC_TZ).hour < 3
 
 
 # ══════════════════════════════════════════════
