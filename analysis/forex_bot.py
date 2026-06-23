@@ -336,7 +336,7 @@ def main():
         logger.info("Weekend detected. Forex market is closed. Exiting.")
         return
 
-    is_daily = (utc_now.hour == 0)
+    is_daily = (utc_now.hour < 3)
     now_bd = datetime.now(BD_TZ).strftime("%d %b %Y | %I:%M %p")
     logger.info(f"Forex Bot Started. Mode: {'DAILY' if is_daily else 'INTRADAY'}")
     
