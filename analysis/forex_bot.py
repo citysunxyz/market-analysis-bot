@@ -322,10 +322,12 @@ def send_telegram(msg: str):
         logger.error("Missing Forex Telegram credentials!"); return
     try:
         import requests
-        requests.post(
+        res = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
             timeout=30)
+        if res.status_code != 200:
+            logger.error(f"Telegram API Error: {res.status_code} - {res.text}")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
